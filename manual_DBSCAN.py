@@ -2,120 +2,265 @@
 DBSCAN: Density-Based Spatial Clustering of Applications with Noise
 """
 
-# Author: Robert Layton <robertlayton@gmail.com>
-#         Joel Nothman <joel.nothman@gmail.com>
-#         Lars Buitinck
-#
-# License: BSD 3 clause
-
 import numpy as np
-import warnings
 from scipy import sparse
+from _dbscan_inner import dbscan_inner
+import NearestNeighbors
 
-from ..base import BaseEstimator, ClusterMixin
-from ..utils.validation import _check_sample_weight, _deprecate_positional_args
-from ..neighbors import NearestNeighbors
+class BaseEstimator:
+    """Base class for all estimators in scikit-learn
+    Notes
+    -----
+    All estimators should specify all the parameters that can be set
+    at the class level in their ``__init__`` as explicit keyword
+    arguments (no ``*args`` or ``**kwargs``).
+    """
 
-from ._dbscan_inner import dbscan_inner
+
+    def _get_param_names(cls):
+        """Get parameter names for the estimator"""
+        # fetch the constructor or the original constructor before
+        # deprecation wrapping if any
+        init = getattr(cls.__init__, 'deprecated_original', cls.__init__)
+        if init is object.__init__:
+            # No explicit constructor to introspect
+            return []
+
+        # introspect the constructor arguments to find the model parameters
+        # to represent
+        init_signature = inspect.signature(init)
+        # Consider the constructor parameters excluding 'self'
+        parameters = [p for p in init_signature.parameters.values()
+                      if p.name != 'self' and p.kind != p.VAR_KEYWORD]
+        for p in parameters:
+            if p.kind == p.VAR_POSITIONAL:
+                raise RuntimeError("scikit-learn estimators should always "
+                                   "specify their parameters in the signature"
+                                   " of their __init__ (no varargs)."
+                                   " %s with constructor %s doesn't "
+                                   " follow this convention."
+                                   % (cls, init_signature))
+        # Extract and sort argument names excluding 'self'
+        return sorted([p.name for p in parameters])
+
+    def get_params(self, deep=True):
+        """
+        Get parameters for this estimator.
+        Parameters
+        ----------
+        deep : bool, default=True
+            If True, will return the parameters for this estimator and
+            contained subobjects that are estimators.
+        Returns
+        -------
+        params : mapping of string to any
+            Parameter names mapped to their values.
+        """
+        out = dict()
+        for key in self._get_param_names():
+            try:
+                value = getattr(self, key)
+            except AttributeError:
+                value = None
+            if deep and hasattr(value, 'get_params'):
+                deep_items = value.get_params().items()
+                out.update((key + '__' + k, val) for k, val in deep_items)
+            out[key] = value
+        return out
+
+    def set_params(self, **params):
+        """
+        Set the parameters of this estimator.
+        The method works on simple estimators as well as on nested objects
+        (such as pipelines). The latter have parameters of the form
+        ``<component>__<parameter>`` so that it's possible to update each
+        component of a nested object.
+        Parameters
+        ----------
+        **params : dict
+            Estimator parameters.
+        Returns
+        -------
+        self : object
+            Estimator instance.
+        """
+        if not params:
+            # Simple optimization to gain speed (inspect is slow)
+            return self
+        valid_params = self.get_params(deep=True)
+
+        nested_params = defaultdict(dict)  # grouped by prefix
+        for key, value in params.items():
+            key, delim, sub_key = key.partition('__')
+            if key not in valid_params:
+                raise ValueError('Invalid parameter %s for estimator %s. '
+                                 'Check the list of available parameters '
+                                 'with `estimator.get_params().keys()`.' %
+                                 (key, self))
+
+            if delim:
+                nested_params[key][sub_key] = value
+            else:
+                setattr(self, key, value)
+                valid_params[key] = value
+
+        for key, sub_params in nested_params.items():
+            valid_params[key].set_params(**sub_params)
+
+        return self
+
+    def __repr__(self, N_CHAR_MAX=700):
+        # N_CHAR_MAX is the (approximate) maximum number of non-blank
+        # characters to render. We pass it as an optional parameter to ease
+        # the tests.
+
+        from .utils._pprint import _EstimatorPrettyPrinter
+
+        N_MAX_ELEMENTS_TO_SHOW = 30  # number of elements to show in sequences
+
+        # use ellipsis for sequences with a lot of elements
+        pp = _EstimatorPrettyPrinter(
+            compact=True, indent=1, indent_at_name=True,
+            n_max_elements_to_show=N_MAX_ELEMENTS_TO_SHOW)
+
+        repr_ = pp.pformat(self)
+
+        # Use bruteforce ellipsis when there are a lot of non-blank characters
+        n_nonblank = len(''.join(repr_.split()))
+        if n_nonblank > N_CHAR_MAX:
+            lim = N_CHAR_MAX // 2  # apprx number of chars to keep on both ends
+            regex = r'^(\s*\S){%d}' % lim
+            # The regex '^(\s*\S){%d}' % n
+            # matches from the start of the string until the nth non-blank
+            # character:
+            # - ^ matches the start of string
+            # - (pattern){n} matches n repetitions of pattern
+            # - \s*\S matches a non-blank char following zero or more blanks
+            left_lim = re.match(regex, repr_).end()
+            right_lim = re.match(regex, repr_[::-1]).end()
+
+            if '\n' in repr_[left_lim:-right_lim]:
+                # The left side and right side aren't on the same line.
+                # To avoid weird cuts, e.g.:
+                # categoric...ore',
+                # we need to start the right side with an appropriate newline
+                # character so that it renders properly as:
+                # categoric...
+                # handle_unknown='ignore',
+                # so we add [^\n]*\n which matches until the next \n
+                regex += r'[^\n]*\n'
+                right_lim = re.match(regex, repr_[::-1]).end()
+
+            ellipsis = '...'
+            if left_lim + len(ellipsis) < len(repr_) - right_lim:
+                # Only add ellipsis if it results in a shorter repr
+                repr_ = repr_[:left_lim] + '...' + repr_[-right_lim:]
+
+        return repr_
+
+    def __getstate__(self):
+        try:
+            state = super().__getstate__()
+        except AttributeError:
+            state = self.__dict__.copy()
+
+        if type(self).__module__.startswith('sklearn.'):
+            return dict(state.items(), _sklearn_version=__version__)
+        else:
+            return state
+
+    def _more_tags(self):
+        return _DEFAULT_TAGS
+
+    def _get_tags(self):
+        collected_tags = {}
+        for base_class in reversed(inspect.getmro(self.__class__)):
+            if hasattr(base_class, '_more_tags'):
+                # need the if because mixins might not have _more_tags
+                # but might do redundant work in estimators
+                # (i.e. calling more tags on BaseEstimator multiple times)
+                more_tags = base_class._more_tags(self)
+                collected_tags.update(more_tags)
+        return collected_tags
+
+    def _check_n_features(self, X, reset):
+
+        n_features = X.shape[1]
+
+        if reset:
+            self.n_features_in_ = n_features
+        else:
+            if not hasattr(self, 'n_features_in_'):
+                raise RuntimeError(
+                    "The reset parameter is False but there is no "
+                    "n_features_in_ attribute. Is this estimator fitted?"
+                )
+            if n_features != self.n_features_in_:
+                raise ValueError(
+                    'X has {} features, but this {} is expecting {} features '
+                    'as input.'.format(n_features, self.__class__.__name__,
+                                       self.n_features_in_)
+                )
+
+    def _validate_data(self, X, y=None, reset=True,
+                       validate_separately=False, **check_params):
 
 
-@_deprecate_positional_args
+        if y is None:
+            if self._get_tags()['requires_y']:
+                raise ValueError(
+                    f"This {self.__class__.__name__} estimator "
+                    f"requires y to be passed, but the target y is None."
+                )
+            X = check_array(X, **check_params)
+            out = X
+        else:
+            if validate_separately:
+                # We need this because some estimators validate X and y
+                # separately, and in general, separately calling check_array()
+                # on X and y isn't equivalent to just calling check_X_y()
+                # :(
+                check_X_params, check_y_params = validate_separately
+                X = check_array(X, **check_X_params)
+                y = check_array(y, **check_y_params)
+            else:
+                X, y = check_X_y(X, y, **check_params)
+            out = X, y
+
+        if check_params.get('ensure_2d', True):
+            self._check_n_features(X, reset=reset)
+
+        return out
+
+    def _repr_html_(self):
+        """HTML representation of estimator.
+        This is redundant with the logic of `_repr_mimebundle_`. The latter
+        should be favorted in the long term, `_repr_html_` is only
+        implemented for consumers who do not interpret `_repr_mimbundle_`.
+        """
+        if get_config()["display"] != 'diagram':
+            raise AttributeError("_repr_html_ is only defined when the "
+                                 "'display' configuration option is set to "
+                                 "'diagram'")
+        return self._repr_html_inner
+
+    def _repr_html_inner(self):
+        """This function is returned by the @property `_repr_html_` to make
+        `hasattr(estimator, "_repr_html_") return `True` or `False` depending
+        on `get_config()["display"]`.
+        """
+        return estimator_html_repr(self)
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Mime bundle used by jupyter kernels to display estimator"""
+        output = {"text/plain": repr(self)}
+        if get_config()["display"] == 'diagram':
+            output["text/html"] = estimator_html_repr(self)
+        return output
+
 def dbscan(X, eps=0.5, *, min_samples=5, metric='minkowski',
            metric_params=None, algorithm='auto', leaf_size=30, p=2,
            sample_weight=None, n_jobs=None):
-    """Perform DBSCAN clustering from vector array or distance matrix.
-    Read more in the :ref:`User Guide <dbscan>`.
-    Parameters
-    ----------
-    X : {array-like, sparse (CSR) matrix} of shape (n_samples, n_features) or \
-            (n_samples, n_samples)
-        A feature array, or array of distances between samples if
-        ``metric='precomputed'``.
-    eps : float, default=0.5
-        The maximum distance between two samples for one to be considered
-        as in the neighborhood of the other. This is not a maximum bound
-        on the distances of points within a cluster. This is the most
-        important DBSCAN parameter to choose appropriately for your data set
-        and distance function.
-    min_samples : int, default=5
-        The number of samples (or total weight) in a neighborhood for a point
-        to be considered as a core point. This includes the point itself.
-    metric : str or callable, default='minkowski'
-        The metric to use when calculating distance between instances in a
-        feature array. If metric is a string or callable, it must be one of
-        the options allowed by :func:`sklearn.metrics.pairwise_distances` for
-        its metric parameter.
-        If metric is "precomputed", X is assumed to be a distance matrix and
-        must be square during fit.
-        X may be a :term:`sparse graph <sparse graph>`,
-        in which case only "nonzero" elements may be considered neighbors.
-    metric_params : dict, default=None
-        Additional keyword arguments for the metric function.
-        .. versionadded:: 0.19
-    algorithm : {'auto', 'ball_tree', 'kd_tree', 'brute'}, default='auto'
-        The algorithm to be used by the NearestNeighbors module
-        to compute pointwise distances and find nearest neighbors.
-        See NearestNeighbors module documentation for details.
-    leaf_size : int, default=30
-        Leaf size passed to BallTree or cKDTree. This can affect the speed
-        of the construction and query, as well as the memory required
-        to store the tree. The optimal value depends
-        on the nature of the problem.
-    p : float, default=2
-        The power of the Minkowski metric to be used to calculate distance
-        between points.
-    sample_weight : array-like of shape (n_samples,), default=None
-        Weight of each sample, such that a sample with a weight of at least
-        ``min_samples`` is by itself a core sample; a sample with negative
-        weight may inhibit its eps-neighbor from being core.
-        Note that weights are absolute, and default to 1.
-    n_jobs : int, default=None
-        The number of parallel jobs to run for neighbors search. ``None`` means
-        1 unless in a :obj:`joblib.parallel_backend` context. ``-1`` means
-        using all processors. See :term:`Glossary <n_jobs>` for more details.
-        If precomputed distance are used, parallel execution is not available
-        and thus n_jobs will have no effect.
-    Returns
-    -------
-    core_samples : ndarray of shape (n_core_samples,)
-        Indices of core samples.
-    labels : ndarray of shape (n_samples,)
-        Cluster labels for each point.  Noisy samples are given the label -1.
-    See also
-    --------
-    DBSCAN
-        An estimator interface for this clustering algorithm.
-    OPTICS
-        A similar estimator interface clustering at multiple values of eps. Our
-        implementation is optimized for memory usage.
-    Notes
-    -----
-    For an example, see :ref:`examples/cluster/plot_dbscan.py
-    <sphx_glr_auto_examples_cluster_plot_dbscan.py>`.
-    This implementation bulk-computes all neighborhood queries, which increases
-    the memory complexity to O(n.d) where d is the average number of neighbors,
-    while original DBSCAN had memory complexity O(n). It may attract a higher
-    memory complexity when querying these nearest neighborhoods, depending
-    on the ``algorithm``.
-    One way to avoid the query complexity is to pre-compute sparse
-    neighborhoods in chunks using
-    :func:`NearestNeighbors.radius_neighbors_graph
-    <sklearn.neighbors.NearestNeighbors.radius_neighbors_graph>` with
-    ``mode='distance'``, then using ``metric='precomputed'`` here.
-    Another way to reduce memory and computation time is to remove
-    (near-)duplicate points and use ``sample_weight`` instead.
-    :func:`cluster.optics <sklearn.cluster.optics>` provides a similar
-    clustering with lower memory usage.
-    References
-    ----------
-    Ester, M., H. P. Kriegel, J. Sander, and X. Xu, "A Density-Based
-    Algorithm for Discovering Clusters in Large Spatial Databases with Noise".
-    In: Proceedings of the 2nd International Conference on Knowledge Discovery
-    and Data Mining, Portland, OR, AAAI Press, pp. 226-231. 1996
-    Schubert, E., Sander, J., Ester, M., Kriegel, H. P., & Xu, X. (2017).
-    DBSCAN revisited, revisited: why and how you should (still) use DBSCAN.
-    ACM Transactions on Database Systems (TODS), 42(3), 19.
-    """
 
     est = DBSCAN(eps=eps, min_samples=min_samples, metric=metric,
                  metric_params=metric_params, algorithm=algorithm,
@@ -125,107 +270,7 @@ def dbscan(X, eps=0.5, *, min_samples=5, metric='minkowski',
 
 
 class DBSCAN(ClusterMixin, BaseEstimator):
-    """Perform DBSCAN clustering from vector array or distance matrix.
-    DBSCAN - Density-Based Spatial Clustering of Applications with Noise.
-    Finds core samples of high density and expands clusters from them.
-    Good for data which contains clusters of similar density.
-    Read more in the :ref:`User Guide <dbscan>`.
-    Parameters
-    ----------
-    eps : float, default=0.5
-        The maximum distance between two samples for one to be considered
-        as in the neighborhood of the other. This is not a maximum bound
-        on the distances of points within a cluster. This is the most
-        important DBSCAN parameter to choose appropriately for your data set
-        and distance function.
-    min_samples : int, default=5
-        The number of samples (or total weight) in a neighborhood for a point
-        to be considered as a core point. This includes the point itself.
-    metric : string, or callable, default='euclidean'
-        The metric to use when calculating distance between instances in a
-        feature array. If metric is a string or callable, it must be one of
-        the options allowed by :func:`sklearn.metrics.pairwise_distances` for
-        its metric parameter.
-        If metric is "precomputed", X is assumed to be a distance matrix and
-        must be square. X may be a :term:`Glossary <sparse graph>`, in which
-        case only "nonzero" elements may be considered neighbors for DBSCAN.
-        .. versionadded:: 0.17
-           metric *precomputed* to accept precomputed sparse matrix.
-    metric_params : dict, default=None
-        Additional keyword arguments for the metric function.
-        .. versionadded:: 0.19
-    algorithm : {'auto', 'ball_tree', 'kd_tree', 'brute'}, default='auto'
-        The algorithm to be used by the NearestNeighbors module
-        to compute pointwise distances and find nearest neighbors.
-        See NearestNeighbors module documentation for details.
-    leaf_size : int, default=30
-        Leaf size passed to BallTree or cKDTree. This can affect the speed
-        of the construction and query, as well as the memory required
-        to store the tree. The optimal value depends
-        on the nature of the problem.
-    p : float, default=None
-        The power of the Minkowski metric to be used to calculate distance
-        between points. If None, then ``p=2`` (equivalent to the Euclidean
-        distance).
-    n_jobs : int, default=None
-        The number of parallel jobs to run.
-        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
-        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
-        for more details.
-    Attributes
-    ----------
-    core_sample_indices_ : ndarray of shape (n_core_samples,)
-        Indices of core samples.
-    components_ : ndarray of shape (n_core_samples, n_features)
-        Copy of each core sample found by training.
-    labels_ : ndarray of shape (n_samples)
-        Cluster labels for each point in the dataset given to fit().
-        Noisy samples are given the label -1.
-    Examples
-    --------
-    >>> from sklearn.cluster import DBSCAN
-    >>> import numpy as np
-    >>> X = np.array([[1, 2], [2, 2], [2, 3],
-    ...               [8, 7], [8, 8], [25, 80]])
-    >>> clustering = DBSCAN(eps=3, min_samples=2).fit(X)
-    >>> clustering.labels_
-    array([ 0,  0,  0,  1,  1, -1])
-    >>> clustering
-    DBSCAN(eps=3, min_samples=2)
-    See also
-    --------
-    OPTICS
-        A similar clustering at multiple values of eps. Our implementation
-        is optimized for memory usage.
-    Notes
-    -----
-    For an example, see :ref:`examples/cluster/plot_dbscan.py
-    <sphx_glr_auto_examples_cluster_plot_dbscan.py>`.
-    This implementation bulk-computes all neighborhood queries, which increases
-    the memory complexity to O(n.d) where d is the average number of neighbors,
-    while original DBSCAN had memory complexity O(n). It may attract a higher
-    memory complexity when querying these nearest neighborhoods, depending
-    on the ``algorithm``.
-    One way to avoid the query complexity is to pre-compute sparse
-    neighborhoods in chunks using
-    :func:`NearestNeighbors.radius_neighbors_graph
-    <sklearn.neighbors.NearestNeighbors.radius_neighbors_graph>` with
-    ``mode='distance'``, then using ``metric='precomputed'`` here.
-    Another way to reduce memory and computation time is to remove
-    (near-)duplicate points and use ``sample_weight`` instead.
-    :class:`cluster.OPTICS` provides a similar clustering with lower memory
-    usage.
-    References
-    ----------
-    Ester, M., H. P. Kriegel, J. Sander, and X. Xu, "A Density-Based
-    Algorithm for Discovering Clusters in Large Spatial Databases with Noise".
-    In: Proceedings of the 2nd International Conference on Knowledge Discovery
-    and Data Mining, Portland, OR, AAAI Press, pp. 226-231. 1996
-    Schubert, E., Sander, J., Ester, M., Kriegel, H. P., & Xu, X. (2017).
-    DBSCAN revisited, revisited: why and how you should (still) use DBSCAN.
-    ACM Transactions on Database Systems (TODS), 42(3), 19.
-    """
-    @_deprecate_positional_args
+
     def __init__(self, eps=0.5, *, min_samples=5, metric='euclidean',
                  metric_params=None, algorithm='auto', leaf_size=30, p=None,
                  n_jobs=None):
@@ -239,25 +284,7 @@ class DBSCAN(ClusterMixin, BaseEstimator):
         self.n_jobs = n_jobs
 
     def fit(self, X, y=None, sample_weight=None):
-        """Perform DBSCAN clustering from features, or distance matrix.
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features), or \
-            (n_samples, n_samples)
-            Training instances to cluster, or distances between instances if
-            ``metric='precomputed'``. If a sparse matrix is provided, it will
-            be converted into a sparse ``csr_matrix``.
-        sample_weight : array-like of shape (n_samples,), default=None
-            Weight of each sample, such that a sample with a weight of at least
-            ``min_samples`` is by itself a core sample; a sample with a
-            negative weight may inhibit its eps-neighbor from being core.
-            Note that weights are absolute, and default to 1.
-        y : Ignored
-            Not used, present here for API consistency by convention.
-        Returns
-        -------
-        self
-        """
+
         X = self._validate_data(X, accept_sparse='csr')
 
         if not self.eps > 0.0:
@@ -266,24 +293,13 @@ class DBSCAN(ClusterMixin, BaseEstimator):
         if sample_weight is not None:
             sample_weight = _check_sample_weight(sample_weight, X)
 
-        # Calculate neighborhood for all samples. This leaves the original
-        # point in, which needs to be considered later (i.e. point i is in the
-        # neighborhood of point i. While True, its useless information)
-        if self.metric == 'precomputed' and sparse.issparse(X):
-            # set the diagonal to explicit values, as a point is its own
-            # neighbor
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', sparse.SparseEfficiencyWarning)
-                X.setdiag(X.diagonal())  # XXX: modifies X's internals in-place
-
         neighbors_model = NearestNeighbors(
             radius=self.eps, algorithm=self.algorithm,
             leaf_size=self.leaf_size, metric=self.metric,
             metric_params=self.metric_params, p=self.p, n_jobs=self.n_jobs)
         neighbors_model.fit(X)
         # This has worst case O(n^2) memory complexity
-        neighborhoods = neighbors_model.radius_neighbors(X,
-                                                         return_distance=False)
+        neighborhoods = neighbors_model.radius_neighbors(X, return_distance=False)
 
         if sample_weight is None:
             n_neighbors = np.array([len(neighbors)
@@ -298,7 +314,11 @@ class DBSCAN(ClusterMixin, BaseEstimator):
         # A list of all core samples found.
         core_samples = np.asarray(n_neighbors >= self.min_samples,
                                   dtype=np.uint8)
+        
+        # DBSCAN INNER:
         dbscan_inner(core_samples, neighborhoods, labels)
+
+        # continue fit()
 
         self.core_sample_indices_ = np.where(core_samples)[0]
         self.labels_ = labels
@@ -311,27 +331,213 @@ class DBSCAN(ClusterMixin, BaseEstimator):
             self.components_ = np.empty((0, X.shape[1]))
         return self
 
-    def fit_predict(self, X, y=None, sample_weight=None):
-        """Perform DBSCAN clustering from features or distance matrix,
-        and return cluster labels.
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features), or \
-            (n_samples, n_samples)
-            Training instances to cluster, or distances between instances if
-            ``metric='precomputed'``. If a sparse matrix is provided, it will
-            be converted into a sparse ``csr_matrix``.
-        sample_weight : array-like of shape (n_samples,), default=None
-            Weight of each sample, such that a sample with a weight of at least
-            ``min_samples`` is by itself a core sample; a sample with a
-            negative weight may inhibit its eps-neighbor from being core.
-            Note that weights are absolute, and default to 1.
-        y : Ignored
-            Not used, present here for API consistency by convention.
-        Returns
-        -------
-        labels : ndarray of shape (n_samples,)
-            Cluster labels. Noisy samples are given the label -1.
-        """
-        self.fit(X, sample_weight=sample_weight)
+    def predict(self, X, y=None, sample_weight=None):
+
+        #self.fit(X, sample_weight=sample_weight)
         return self.labels_
+
+
+    def _check_sample_weight(self, sample_weight, X, dtype=None):
+
+        #n_samples = _num_samples(X)
+
+        message = 'Expected sequence or array-like, got %s' % type(X)
+        if hasattr(X, 'fit') and callable(X.fit):
+            # Don't get num_samples from an ensembles length!
+            raise TypeError(message)
+
+        if not hasattr(X, '__len__') and not hasattr(X, 'shape'):
+            if hasattr(X, '__array__'):
+                X = np.asarray(X)
+            else:
+                raise TypeError(message)
+
+        if hasattr(X, 'shape') and X.shape is not None:
+            if len(X.shape) == 0:
+                raise TypeError("Singleton array %r cannot be considered"
+                                " a valid collection." % X)
+            # Check that shape is returning an integer or default to len
+            # Dask dataframes may not return numeric shape[0] value
+            if isinstance(X.shape[0], numbers.Integral):
+                n_samples = X.shape[0]
+
+        try:
+            n_samples = len(X)
+        except TypeError as type_error:
+            raise TypeError(message) from type_error
+
+        # continue #checksample_weight
+        if dtype is not None and dtype not in [np.float32, np.float64]:
+            dtype = np.float64
+
+        if sample_weight is None:
+            sample_weight = np.ones(n_samples, dtype=dtype)
+        elif isinstance(sample_weight, numbers.Number):
+            sample_weight = np.full(n_samples, sample_weight, dtype=dtype)
+        else:
+            if dtype is None:
+                dtype = [np.float64, np.float32]
+
+            #CHECK ARRAY
+            def check_array(array, accept_sparse=False, *, accept_large_sparse=True,
+                dtype="numeric", order=None, copy=False, force_all_finite=True,
+                ensure_2d=True, allow_nd=False, ensure_min_samples=1,
+                ensure_min_features=1, estimator=None):
+                
+                # store reference to original array to check if copy is needed when
+                # function returns
+                array_orig = array
+
+                # store whether originally we wanted numeric dtype
+                dtype_numeric = isinstance(dtype, str) and dtype == "numeric"
+
+                dtype_orig = getattr(array, "dtype", None)
+                if not hasattr(dtype_orig, 'kind'):
+                    # not a data type (e.g. a column named dtype in a pandas DataFrame)
+                    dtype_orig = None
+
+                # check if the object contains several dtypes (typically a pandas
+                # DataFrame), and store them. If not, store None.
+                dtypes_orig = list([])
+                has_pd_integer_array = False
+                if hasattr(array, "dtypes") and hasattr(array.dtypes, '__array__'):
+                    # throw warning if columns are sparse. If all columns are sparse, then
+                    # array.sparse exists and sparsity will be perserved (later).
+                    with suppress(ImportError): dtypes_orig = list(array.dtypes)
+                    # pandas boolean dtype __array__ interface coerces bools to objects
+                    for i, dtype_iter in enumerate(dtypes_orig):
+                        if dtype_iter.kind == 'b':
+                            dtypes_orig[i] = np.dtype(object)
+                        elif dtype_iter.name.startswith(("Int", "UInt")):
+                            # name looks like an Integer Extension Array, now check for
+                            # the dtype
+                            with suppress(ImportError):
+                                from pandas import (Int8Dtype, Int16Dtype,
+                                                    Int32Dtype, Int64Dtype,
+                                                    UInt8Dtype, UInt16Dtype,
+                                                    UInt32Dtype, UInt64Dtype)
+                                if isinstance(dtype_iter, (Int8Dtype, Int16Dtype,
+                                                        Int32Dtype, Int64Dtype,
+                                                        UInt8Dtype, UInt16Dtype,
+                                                        UInt32Dtype, UInt64Dtype)):
+                                    has_pd_integer_array = True
+
+                    if all(isinstance(dtype, np.dtype) for dtype in dtypes_orig):
+                        dtype_orig = np.result_type(*dtypes_orig)
+
+                if dtype_numeric:
+                    if dtype_orig is not None and dtype_orig.kind == "O":
+                        # if input is object, convert to float.
+                        dtype = np.float64
+                    else:
+                        dtype = None
+
+                if isinstance(dtype, (list, tuple)):
+                    if dtype_orig is not None and dtype_orig in dtype:
+                        # no dtype conversion required
+                        dtype = None
+                    else:
+                        # dtype conversion required. Let's select the first element of the
+                        # list of accepted types
+                        dtype = dtype[0]
+
+                if has_pd_integer_array:
+                    # If there are any pandas integer extension arrays,
+                    array = array.astype(dtype)
+
+                if force_all_finite not in (True, False, 'allow-nan'):
+                    raise ValueError('force_all_finite should be a bool or "allow-nan"'
+                                    '. Got {!r} instead'.format(force_all_finite))
+
+                if estimator is not None:
+                    if isinstance(estimator, str):
+                        estimator_name = estimator
+                    else:
+                        estimator_name = estimator.__class__.__name__
+                else:
+                    estimator_name = "Estimator"
+                context = " by %s" % estimator_name if estimator is not None else ""
+
+                # When all dataframe columns are sparse, convert to a sparse array
+                if hasattr(array, 'sparse') and array.ndim > 1:
+                    # DataFrame.sparse only supports `to_coo`
+                    array = array.sparse.to_coo()
+
+                if sp.issparse(array):
+                    _ensure_no_complex_data(array)
+                    array = _ensure_sparse_format(array, accept_sparse=accept_sparse,
+                                                dtype=dtype, copy=copy,
+                                                force_all_finite=force_all_finite,
+                                                accept_large_sparse=accept_large_sparse)
+                else:
+                    # If np.array(..) gives ComplexWarning, then we convert the warning
+                    # to an error. This is needed because specifying a non complex
+                    # dtype to the function converts complex to real dtype,
+                    # thereby passing the test made in the lines following the scope
+                    # of warnings context manager.
+
+                    # It is possible that the np.array(..) gave no warning. This happens
+                    # when no dtype conversion happened, for example dtype = None. The
+                    # result is that np.array(..) produces an array of complex dtype
+                    # and we need to catch and raise exception for such cases.
+                    _ensure_no_complex_data(array)
+
+                    if ensure_2d:
+                        # If input is scalar raise error
+                        if array.ndim == 0:
+                            raise ValueError(
+                                "Expected 2D array, got scalar array instead:\narray={}.\n"
+                                "Reshape your data either using array.reshape(-1, 1) if "
+                                "your data has a single feature or array.reshape(1, -1) "
+                                "if it contains a single sample.".format(array))
+                        # If input is 1D raise error
+                        if array.ndim == 1:
+                            raise ValueError(
+                                "Expected 2D array, got 1D array instead:\narray={}.\n"
+                                "Reshape your data either using array.reshape(-1, 1) if "
+                                "your data has a single feature or array.reshape(1, -1) "
+                                "if it contains a single sample.".format(array))
+
+                    # make sure we actually converted to numeric:
+                    if dtype_numeric and array.dtype.kind == "O":
+                        array = array.astype(np.float64)
+                    if not allow_nd and array.ndim >= 3:
+                        raise ValueError("Found array with dim %d. %s expected <= 2."
+                                        % (array.ndim, estimator_name))
+
+                    if force_all_finite:
+                        _assert_all_finite(array,
+                                        allow_nan=force_all_finite == 'allow-nan')
+
+                if ensure_min_samples > 0:
+                    n_samples = _num_samples(array)
+                    if n_samples < ensure_min_samples:
+                        raise ValueError("Found array with %d sample(s) (shape=%s) while a"
+                                        " minimum of %d is required%s."
+                                        % (n_samples, array.shape, ensure_min_samples,
+                                            context))
+
+                if ensure_min_features > 0 and array.ndim == 2:
+                    n_features = array.shape[1]
+                    if n_features < ensure_min_features:
+                        raise ValueError("Found array with %d feature(s) (shape=%s) while"
+                                        " a minimum of %d is required%s."
+                                        % (n_features, array.shape, ensure_min_features,
+                                            context))
+
+                if copy and np.may_share_memory(array, array_orig):
+                    array = np.array(array, dtype=dtype, order=order)
+
+                return array
+
+            sample_weight = check_array(sample_weight, accept_sparse=False, ensure_2d=False, dtype=dtype, order="C")
+
+            #continue #checksample_weight
+
+            if sample_weight.ndim != 1:
+                raise ValueError("Sample weights must be 1D array or scalar")
+
+            if sample_weight.shape != (n_samples,):
+                raise ValueError("sample_weight.shape == {}, expected {}!"
+                                .format(sample_weight.shape, (n_samples,)))
+        return sample_weight
